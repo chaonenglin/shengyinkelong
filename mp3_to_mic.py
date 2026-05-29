@@ -131,6 +131,64 @@ def install_vbcable(src_dir):
     )
 
 
+def check_device_rate(device_index, rate, is_input=False):
+    """检查设备是否支持某个采样率"""
+    p = pyaudio.PyAudio()
+    try:
+        if is_input:
+            return p.is_format_supported(
+                rate, input_device=device_index,
+                input_channels=1, input_format=pyaudio.paInt16
+            )
+        else:
+            return p.is_format_supported(
+                rate, output_device=device_index,
+                output_channels=2, output_format=pyaudio.paInt16
+            )
+    except Exception:
+        return False
+    finally:
+        p.terminate()
+
+
+def find_common_sample_rate(device_indices, is_input_flags):
+    """找一个所有设备都支持的采样率"""
+    for rate in [48000, 44100, 22050, 16000]:
+        ok = True
+        for dev_idx, is_input in zip(device_indices, is_input_flags):
+            if not check_device_rate(dev_idx, rate, is_input):
+                ok = False
+                break
+        if ok:
+            return rate
+    return 44100  # 兜底
+
+
+def get_device_sample_rate(device_index):
+    """获取设备默认采样率"""
+    p = pyaudio.PyAudio()
+    try:
+        info = p.get_device_info_by_index(device_index)
+        return int(info.get("defaultSampleRate", 44100))
+    finally:
+        p.terminate()
+
+
+def pyaudio_to_sd_index(pyaudio_name):
+    """将 pyaudio 设备名映射到 sounddevice 设备索引"""
+    name_lower = pyaudio_name.lower().strip()
+    for dev in sd.query_devices():
+        if dev['name'].lower().strip() == name_lower and dev['max_output_channels'] > 0:
+            return dev['index']
+    # 模糊匹配
+    for dev in sd.query_devices():
+        dev_name = dev['name'].lower().strip()
+        if name_lower in dev_name or dev_name in name_lower:
+            if dev['max_output_channels'] > 0:
+                return dev['index']
+    return None
+
+
 def get_wasapi_devices():
     p = pyaudio.PyAudio()
     devices = []
@@ -237,59 +295,57 @@ if _ffmpeg:
     AudioSegment.converter = _ffmpeg
 
 
-# === WASAPI 播放流 ===
+# === 播放流（使用 sounddevice，更稳定） ===
 class WASAPIStream:
     def __init__(self, device_index, sample_rate, channels):
-        self.p = pyaudio.PyAudio()
         self.idx = device_index
         self.sr = sample_rate
         self.ch = channels
         self.stream = None
-        self._frame = 0
         self._data = None
+        self._frame = 0
         self._stop = False
 
     def start(self, audio_data, volume=1.0):
-        self._data = audio_data
+        self._data = audio_data.copy() * volume
         self._frame = 0
-        self._vol = volume
         self._stop = False
+        ch = self.ch
 
-        def cb(in_data, frame_count, time_info, status):
+        def callback(outdata, frames, time_info, status):
             if self._stop:
-                return (b'', pyaudio.paComplete)
+                raise sd.CallbackStop()
             s = self._frame
-            e = min(s + frame_count, len(self._data))
-            chunk = self._data[s:e] * self._vol
-            raw = (chunk * 32767).astype(np.int16).tobytes()
-            if len(chunk) < frame_count:
-                raw += b'\x00' * (frame_count - len(chunk)) * self.ch * 2
-                self._frame = len(self._data)
-                return (raw, pyaudio.paComplete)
+            e = min(s + frames, len(self._data))
+            chunk = self._data[s:e]
+            if len(chunk) < frames:
+                outdata[:len(chunk)] = chunk
+                outdata[len(chunk):] = 0
+                raise sd.CallbackStop()
+            outdata[:] = chunk
             self._frame = e
-            return (raw, pyaudio.paContinue)
 
-        self.stream = self.p.open(format=pyaudio.paInt16, channels=self.ch,
-                                   rate=self.sr, output=True,
-                                   output_device_index=self.idx,
-                                   frames_per_buffer=CHUNK_SIZE, stream_callback=cb)
-        self.stream.start_stream()
+        self.stream = sd.OutputStream(
+            device=self.idx, channels=ch, samplerate=self.sr,
+            callback=callback, dtype='float32',
+            blocksize=CHUNK_SIZE
+        )
+        self.stream.start()
 
     def is_active(self):
-        return self.stream and self.stream.is_active()
+        return self.stream and self.stream.active and not self._stop
 
     def stop(self):
         self._stop = True
         if self.stream:
             try:
-                self.stream.stop_stream()
+                self.stream.stop()
                 self.stream.close()
             except:
                 pass
-        self.p.terminate()
 
 
-# === WASAPI Loopback 捕获 ===
+# === Loopback 捕获（pyaudiowpatch 输入 + sounddevice 输出） ===
 class WASAPICapture:
     def __init__(self, capture_idx, output_idx, monitor_idx=None, sr=48000, ch=2):
         self.p = pyaudio.PyAudio()
@@ -303,80 +359,120 @@ class WASAPICapture:
         self.mon_stream = None
         self._stop = False
         self._vol = 1.0
-        self._buf_out = bytearray()
-        self._buf_mon = bytearray()
+        self._buf_out = np.zeros((0, ch), dtype=np.float32)
+        self._buf_mon = np.zeros((0, ch), dtype=np.float32)
         self._lock = threading.Lock()
+        self._sd_out = None
+        self._sd_mon = None
 
     def start(self, volume=1.0):
         self._vol = volume
         self._stop = False
 
-        def _read(buf):
-            need = CHUNK_SIZE * self.ch * 2
-            with self._lock:
-                if len(buf) >= need:
-                    d = bytes(buf[:need])
-                    del buf[:need]
-                else:
-                    d = bytes(buf) + b'\x00' * (need - len(buf))
-                    buf.clear()
-            return d
-
-        def out_cb(in_data, frame_count, time_info, status):
-            return (_read(self._buf_out), pyaudio.paContinue)
-
-        self.out_stream = self.p.open(format=pyaudio.paInt16, channels=self.ch,
-                                       rate=self.sr, output=True,
-                                       output_device_index=self.out_idx,
-                                       frames_per_buffer=CHUNK_SIZE, stream_callback=out_cb)
-
-        if self.mon_idx is not None and self.mon_idx != self.out_idx:
-            def mon_cb(in_data, frame_count, time_info, status):
-                return (_read(self._buf_mon), pyaudio.paContinue)
-            self.mon_stream = self.p.open(format=pyaudio.paInt16, channels=self.ch,
-                                           rate=self.sr, output=True,
-                                           output_device_index=self.mon_idx,
-                                           frames_per_buffer=CHUNK_SIZE, stream_callback=mon_cb)
-
+        # loopback 输入（必须用 pyaudiowpatch）
         def cap_cb(in_data, frame_count, time_info, status):
-            if self._stop:
-                return (b'', pyaudio.paComplete)
-            if self._vol != 1.0:
-                a = np.frombuffer(in_data, dtype=np.int16).astype(np.float32)
-                a = (a * self._vol).clip(-32768, 32767).astype(np.int16).tobytes()
-            else:
-                a = in_data
+            try:
+                if self._stop:
+                    return (b'', pyaudio.paComplete)
+                data = np.frombuffer(in_data, dtype=np.int16).reshape(-1, self.ch).astype(np.float32) / 32768.0
+                if self._vol != 1.0:
+                    data = data * self._vol
+                with self._lock:
+                    self._buf_out = np.concatenate([self._buf_out, data])
+                    self._buf_mon = np.concatenate([self._buf_mon, data])
+                return (b'', pyaudio.paContinue)
+            except Exception:
+                return (b'\x00' * (frame_count * self.ch * 2), pyaudio.paContinue)
+
+        # 逐个尝试采样率打开 loopback 输入
+        rates = [self.sr] + [r for r in [48000, 44100, 22050, 16000] if r != self.sr]
+        last_err = None
+        for rate in rates:
+            try:
+                self.cap_stream = self.p.open(
+                    format=pyaudio.paInt16, channels=self.ch,
+                    rate=rate, input=True,
+                    input_device_index=self.cap_idx,
+                    frames_per_buffer=CHUNK_SIZE, stream_callback=cap_cb)
+                self.sr = rate
+                self.cap_stream.start_stream()
+                break
+            except Exception as e:
+                last_err = e
+                self.cap_stream = None
+        if self.cap_stream is None:
+            raise RuntimeError(f"截取设备不支持任何采样率: {last_err}")
+
+        # sounddevice 输出到虚拟麦克风
+        def out_callback(outdata, frames, time_info, status):
             with self._lock:
-                self._buf_out.extend(a)
-                self._buf_mon.extend(a)
-            return (b'', pyaudio.paContinue)
+                if len(self._buf_out) >= frames:
+                    outdata[:] = self._buf_out[:frames]
+                    self._buf_out = self._buf_out[frames:]
+                elif len(self._buf_out) > 0:
+                    outdata[:len(self._buf_out)] = self._buf_out
+                    outdata[len(self._buf_out):] = 0
+                    self._buf_out = np.zeros((0, self.ch), dtype=np.float32)
+                else:
+                    outdata[:] = 0
 
-        self.cap_stream = self.p.open(format=pyaudio.paInt16, channels=self.ch,
-                                       rate=self.sr, input=True,
-                                       input_device_index=self.cap_idx,
-                                       frames_per_buffer=CHUNK_SIZE, stream_callback=cap_cb)
+        self._sd_out = sd.OutputStream(
+            device=self.out_idx, channels=self.ch, samplerate=self.sr,
+            callback=out_callback, dtype='float32', blocksize=CHUNK_SIZE)
+        self._sd_out.start()
 
-        self.cap_stream.start_stream()
-        self.out_stream.start_stream()
-        if self.mon_stream:
-            self.mon_stream.start_stream()
+        # sounddevice 输出到监听扬声器
+        if self.mon_idx is not None and self.mon_idx != self.out_idx:
+            def mon_callback(outdata, frames, time_info, status):
+                with self._lock:
+                    if len(self._buf_mon) >= frames:
+                        outdata[:] = self._buf_mon[:frames]
+                        self._buf_mon = self._buf_mon[frames:]
+                    elif len(self._buf_mon) > 0:
+                        outdata[:len(self._buf_mon)] = self._buf_mon
+                        outdata[len(self._buf_mon):] = 0
+                        self._buf_mon = np.zeros((0, self.ch), dtype=np.float32)
+                    else:
+                        outdata[:] = 0
+
+            self._sd_mon = sd.OutputStream(
+                device=self.mon_idx, channels=self.ch, samplerate=self.sr,
+                callback=mon_callback, dtype='float32', blocksize=CHUNK_SIZE)
+            self._sd_mon.start()
 
     def is_active(self):
-        return self.cap_stream and self.cap_stream.is_active()
+        try:
+            return self.cap_stream and self.cap_stream.is_active() and not self._stop
+        except Exception:
+            return False
 
     def set_volume(self, v):
         self._vol = v
 
     def stop(self):
         self._stop = True
-        for s in [self.cap_stream, self.out_stream, self.mon_stream]:
-            if s:
-                try:
-                    s.stop_stream()
-                    s.close()
-                except:
-                    pass
-        self.p.terminate()
+        if self.cap_stream:
+            try:
+                self.cap_stream.stop_stream()
+                self.cap_stream.close()
+            except:
+                pass
+        if self._sd_out:
+            try:
+                self._sd_out.stop()
+                self._sd_out.close()
+            except:
+                pass
+        if self._sd_mon:
+            try:
+                self._sd_mon.stop()
+                self._sd_mon.close()
+            except:
+                pass
+        try:
+            self.p.terminate()
+        except:
+            pass
 
 
 # === 解码线程 ===
@@ -897,17 +993,24 @@ class MainWindow(QMainWindow):
 
             self.wasapi_streams = []
             audio = self.audio_data
-            sr = self.sample_rate
+            orig_sr = self.sample_rate
             ch = audio.shape[1] if audio.ndim > 1 else 2
 
+            # 转换为 sounddevice 设备索引
             if mic_idx is not None:
-                s = WASAPIStream(mic_idx, sr, ch)
-                s.start(audio, self.volume)
-                self.wasapi_streams.append(s)
+                mic_name = self.mic_devs[self.mic_combo.currentIndex()]["name"]
+                sd_idx = pyaudio_to_sd_index(mic_name)
+                if sd_idx is not None:
+                    s = WASAPIStream(sd_idx, orig_sr, ch)
+                    s.start(audio, self.volume)
+                    self.wasapi_streams.append(s)
             if spk_idx is not None:
-                s = WASAPIStream(spk_idx, sr, ch)
-                s.start(audio, self.volume)
-                self.wasapi_streams.append(s)
+                spk_name = self.spk_devs[self.spk_combo.currentIndex()]["name"]
+                sd_idx = pyaudio_to_sd_index(spk_name)
+                if sd_idx is not None:
+                    s = WASAPIStream(sd_idx, orig_sr, ch)
+                    s.start(audio, self.volume)
+                    self.wasapi_streams.append(s)
 
             self.status_label.setText("播放中...")
             self.status_label.setStyleSheet(f"color: #4a9; background: transparent; font: 10px 'Microsoft YaHei';")
@@ -975,45 +1078,63 @@ class MainWindow(QMainWindow):
         return None
 
     def _start_capture(self):
-        cap_idx = self._get_dev_idx(self.cap_combo, self._loopback_devices)
-        mic_idx = self._get_dev_idx(self.mic_combo, self.mic_devs)
-        spk_idx = self._get_dev_idx(self.spk_combo, self.spk_devs)
+        try:
+            cap_idx = self._get_dev_idx(self.cap_combo, self._loopback_devices)
+            mic_idx = self._get_dev_idx(self.mic_combo, self.mic_devs)
+            spk_idx = self._get_dev_idx(self.spk_combo, self.spk_devs)
 
-        if cap_idx is None or mic_idx is None:
-            return
+            if cap_idx is None or mic_idx is None:
+                return
 
-        # 检测回音
-        cap_name = self._loopback_devices[self.cap_combo.currentIndex()]["name"]
-        mon_idx = spk_idx
-        if spk_idx is not None:
-            spk_name = self.spk_devs[self.spk_combo.currentIndex()]["name"]
-            import re
-            def _base(n):
-                return re.sub(r'\[.*?\]|立体声混音|Loopback', '', n).lower().strip()
-            if _base(cap_name) == _base(spk_name):
-                mon_idx = None
+            # 检测回音
+            cap_name = self._loopback_devices[self.cap_combo.currentIndex()]["name"]
+            mon_idx = spk_idx
+            if spk_idx is not None:
+                spk_name = self.spk_devs[self.spk_combo.currentIndex()]["name"]
+                import re
+                def _base(n):
+                    return re.sub(r'\[.*?\]|立体声混音|Loopback', '', n).lower().strip()
+                if _base(cap_name) == _base(spk_name):
+                    mon_idx = None
 
-        self.capture = WASAPICapture(cap_idx, mic_idx, mon_idx)
-        self.capture.start(volume=self.cap_vol_slider.value() / 100)
-        self.cap_start_btn.setEnabled(False)
-        self.cap_stop_btn.setEnabled(True)
-        self.cap_status.setText("截取中...")
-        self.cap_status.setStyleSheet(f"color: #4a9; background: transparent; font: 10px 'Microsoft YaHei';")
+            # 输出设备转为 sounddevice 索引
+            mic_name = self.mic_devs[self.mic_combo.currentIndex()]["name"]
+            sd_out_idx = pyaudio_to_sd_index(mic_name)
+            sd_mon_idx = None
+            if mon_idx is not None:
+                spk_name = self.spk_devs[self.spk_combo.currentIndex()]["name"]
+                sd_mon_idx = pyaudio_to_sd_index(spk_name)
 
-        self._cap_timer = QTimer()
-        self._cap_timer.timeout.connect(self._update_cap_vol)
-        self._cap_timer.start(200)
+            self.capture = WASAPICapture(cap_idx, sd_out_idx, sd_mon_idx)
+            self.capture.start(volume=self.cap_vol_slider.value() / 100)
+            self.cap_start_btn.setEnabled(False)
+            self.cap_stop_btn.setEnabled(True)
+            self.cap_status.setText("截取中...")
+            self.cap_status.setStyleSheet(f"color: #4a9; background: transparent; font: 10px 'Microsoft YaHei';")
+
+            self._cap_timer = QTimer()
+            self._cap_timer.timeout.connect(self._update_cap_vol)
+            self._cap_timer.start(200)
+        except Exception as e:
+            self.cap_status.setText(f"截取失败: {e}")
+            self.cap_status.setStyleSheet(f"color: #f44; background: transparent; font: 10px 'Microsoft YaHei';")
 
     def _update_cap_vol(self):
-        if self.capture and self.capture.is_active():
-            self.capture.set_volume(self.cap_vol_slider.value() / 100)
-        else:
+        try:
+            if self.capture and self.capture.is_active():
+                self.capture.set_volume(self.cap_vol_slider.value() / 100)
+            else:
+                self._cap_timer.stop()
+        except Exception:
             self._cap_timer.stop()
 
     def _stop_capture(self):
-        if self.capture:
-            self.capture.stop()
-            self.capture = None
+        try:
+            if self.capture:
+                self.capture.stop()
+        except Exception:
+            pass
+        self.capture = None
         self.cap_start_btn.setEnabled(True)
         self.cap_stop_btn.setEnabled(False)
         self.cap_status.setText("已停止")
