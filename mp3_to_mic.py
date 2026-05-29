@@ -121,9 +121,16 @@ def check_vbcable_installed():
 
 def install_vbcable(installer_path):
     """以管理员权限运行 VB-Cable 安装程序"""
-    # ShellExecute with "runas" 提权
+    # 必须先复制到临时目录，否则自解压安装包找不到配套 .inf 文件
+    import shutil
+    import tempfile
+    tmp_dir = os.path.join(tempfile.gettempdir(), "vbcable_setup")
+    os.makedirs(tmp_dir, exist_ok=True)
+    dst = os.path.join(tmp_dir, "VBCABLE_Setup_x64.exe")
+    shutil.copy2(installer_path, dst)
+    # 以管理员权限运行，不加 /S 让用户交互安装
     ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", installer_path, "/S", None, 1
+        None, "runas", dst, "", tmp_dir, 1
     )
 
 
