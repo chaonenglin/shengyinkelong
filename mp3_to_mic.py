@@ -40,9 +40,29 @@ TEXT2 = "#7a8a9a"
 
 def find_ffmpeg():
     import shutil
+    # 1. 打包后的临时目录
+    if hasattr(sys, '_MEIPASS'):
+        bundled = os.path.join(sys._MEIPASS, "ffmpeg.exe")
+        if os.path.isfile(bundled):
+            return bundled
+    # 2. exe 同目录
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+        for name in ["ffmpeg.exe", os.path.join("ffmpeg", "ffmpeg.exe")]:
+            p = os.path.join(exe_dir, name)
+            if os.path.isfile(p):
+                return p
+    # 3. 脚本同目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for name in ["ffmpeg.exe", os.path.join("ffmpeg", "ffmpeg.exe")]:
+        p = os.path.join(script_dir, name)
+        if os.path.isfile(p):
+            return p
+    # 4. 系统 PATH
     path = shutil.which("ffmpeg")
     if path:
         return path
+    # 5. winget 安装路径
     home = os.path.expanduser("~")
     winget_pkg = os.path.join(home, r"AppData\Local\Microsoft\WinGet\Packages")
     if os.path.isdir(winget_pkg):
@@ -113,12 +133,16 @@ def find_real_speaker(devices):
 def decode_audio(file_path, ffmpeg_path=None):
     file_path = str(file_path)
     ext = Path(file_path).suffix.lower()
+    # MP3 必须有 ffmpeg
+    if ext == ".mp3" and not ffmpeg_path:
+        raise RuntimeError("缺少 ffmpeg，无法解码 MP3\n请安装 ffmpeg 或下载完整版程序")
     if ext == ".mp3" and ffmpeg_path:
         cmd = [ffmpeg_path, "-i", file_path, "-f", "wav", "-acodec", "pcm_s16le",
                "-ar", "48000", "-ac", "2", "pipe:1"]
         result = subprocess.run(cmd, capture_output=True, timeout=60)
         if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg 解码失败")
+            err = result.stderr.decode(errors="ignore")[-200:] if result.stderr else ""
+            raise RuntimeError(f"ffmpeg 解码失败: {err}")
         data = result.stdout
         idx = data.find(b"data")
         if idx == -1:
@@ -612,10 +636,11 @@ class MainWindow(QMainWindow):
         # 底部提示
         hints = []
         if not self._ffmpeg:
-            hints.append("需要 ffmpeg")
+            hints.append("⚠ 未找到 ffmpeg，MP3 将无法播放（WAV/FLAC 不受影响）。请安装 ffmpeg 或下载完整版。")
         if hints:
             hint = QLabel(" | ".join(hints))
-            hint.setStyleSheet(f"color: {TEXT2}; background: transparent; font: 8px 'Microsoft YaHei';")
+            hint.setStyleSheet(f"color: #f44; background: transparent; font: 10px 'Microsoft YaHei';")
+            hint.setWordWrap(True)
             layout.addWidget(hint)
 
     def _make_device_row(self, label_text, key):

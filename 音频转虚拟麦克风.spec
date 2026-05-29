@@ -5,7 +5,11 @@ a = Analysis(
     ['mp3_to_mic.py'],
     pathex=[],
     binaries=[],
-    datas=[('VBCABLE_Setup_x64.exe', '.'), ('图标', '图标')],
+    datas=[
+        ('VBCABLE_Setup_x64.exe', '.'),
+        ('ffmpeg.exe', '.'),
+        ('图标', '图标'),
+    ],
     hiddenimports=['pyaudiowpatch', 'pydub', 'sounddevice', 'numpy', 'pycaw', 'comtypes', 'PIL', 'PyQt6'],
     hookspath=[],
     hooksconfig={},

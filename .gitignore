@@ -10,6 +10,9 @@ dist/
 *.spec.bak
 *.rar
 
+# Build dependencies (too large for git)
+ffmpeg.exe
+
 # Temp audio files
 tmp*.mp3
 
