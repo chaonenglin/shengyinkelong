@@ -75,19 +75,19 @@ def find_ffmpeg():
     return None
 
 
-def find_vbcable_installer():
-    """查找 VB-Cable 安装程序（只在 exe 同目录找）"""
-    # exe 同目录
+def find_vbcable_dir():
+    """查找 VB-Cable 安装目录（包含配套 .inf/.sys/.cat 文件）"""
+    # exe 同目录下的 vbcable 文件夹
     if getattr(sys, 'frozen', False):
         exe_dir = os.path.dirname(sys.executable)
-        p = os.path.join(exe_dir, "VBCABLE_Setup_x64.exe")
-        if os.path.isfile(p):
-            return p
-    # 脚本同目录
+        d = os.path.join(exe_dir, "vbcable")
+        if os.path.isdir(d) and os.path.isfile(os.path.join(d, "VBCABLE_Setup_x64.exe")):
+            return d
+    # 脚本同目录下的 vbcable 文件夹
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    p = os.path.join(script_dir, "VBCABLE_Setup_x64.exe")
-    if os.path.isfile(p):
-        return p
+    d = os.path.join(script_dir, "vbcable")
+    if os.path.isdir(d) and os.path.isfile(os.path.join(d, "VBCABLE_Setup_x64.exe")):
+        return d
     return None
 
 
@@ -114,16 +114,15 @@ def check_vbcable_installed():
     return False
 
 
-def install_vbcable(installer_path):
-    """以管理员权限运行 VB-Cable 安装程序"""
+def install_vbcable(src_dir):
+    """复制整个安装目录到临时文件夹，以管理员权限运行"""
     import shutil
     import tempfile
-    src_dir = os.path.dirname(installer_path)
     tmp_dir = os.path.join(tempfile.gettempdir(), "vbcable_setup")
     # 清理旧的临时目录
     if os.path.isdir(tmp_dir):
         shutil.rmtree(tmp_dir)
-    # 复制安装目录的所有文件到临时目录（安装程序需要配套的 .inf 等文件）
+    # 复制整个目录（.inf/.cat/.sys 等配套文件必须和安装程序在同一目录）
     shutil.copytree(src_dir, tmp_dir)
     dst = os.path.join(tmp_dir, "VBCABLE_Setup_x64.exe")
     # 以管理员权限运行，设置工作目录为临时目录
@@ -416,8 +415,8 @@ class MainWindow(QMainWindow):
         """检测 VB-Cable 是否安装，未安装则提示"""
         if check_vbcable_installed():
             return
-        installer = find_vbcable_installer()
-        if not installer:
+        vbcable_dir = find_vbcable_dir()
+        if not vbcable_dir:
             return
         reply = QMessageBox.question(
             self, "需要安装虚拟音频驱动",
@@ -427,7 +426,7 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes
         )
         if reply == QMessageBox.StandardButton.Yes:
-            install_vbcable(installer)
+            install_vbcable(vbcable_dir)
             QMessageBox.information(
                 self, "安装提示",
                 "安装程序已启动，请按提示完成安装。\n\n"

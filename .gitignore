@@ -12,6 +12,7 @@ dist/
 
 # Build dependencies (too large for git)
 ffmpeg.exe
+vbcable/
 
 # Temp audio files
 tmp*.mp3
