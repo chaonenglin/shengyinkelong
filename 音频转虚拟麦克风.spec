@@ -6,7 +6,6 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        ('VBCABLE_Setup_x64.exe', '.'),
         ('ffmpeg.exe', '.'),
         ('图标', '图标'),
     ],

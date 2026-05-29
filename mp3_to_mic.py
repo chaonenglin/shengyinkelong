@@ -76,19 +76,14 @@ def find_ffmpeg():
 
 
 def find_vbcable_installer():
-    """查找 VB-Cable 安装程序"""
-    # 1. 打包后的临时目录
-    if hasattr(sys, '_MEIPASS'):
-        p = os.path.join(sys._MEIPASS, "VBCABLE_Setup_x64.exe")
-        if os.path.isfile(p):
-            return p
-    # 2. exe 同目录
+    """查找 VB-Cable 安装程序（只在 exe 同目录找）"""
+    # exe 同目录
     if getattr(sys, 'frozen', False):
         exe_dir = os.path.dirname(sys.executable)
         p = os.path.join(exe_dir, "VBCABLE_Setup_x64.exe")
         if os.path.isfile(p):
             return p
-    # 3. 脚本同目录
+    # 脚本同目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
     p = os.path.join(script_dir, "VBCABLE_Setup_x64.exe")
     if os.path.isfile(p):
@@ -121,14 +116,17 @@ def check_vbcable_installed():
 
 def install_vbcable(installer_path):
     """以管理员权限运行 VB-Cable 安装程序"""
-    # 必须先复制到临时目录，否则自解压安装包找不到配套 .inf 文件
     import shutil
     import tempfile
+    src_dir = os.path.dirname(installer_path)
     tmp_dir = os.path.join(tempfile.gettempdir(), "vbcable_setup")
-    os.makedirs(tmp_dir, exist_ok=True)
+    # 清理旧的临时目录
+    if os.path.isdir(tmp_dir):
+        shutil.rmtree(tmp_dir)
+    # 复制安装目录的所有文件到临时目录（安装程序需要配套的 .inf 等文件）
+    shutil.copytree(src_dir, tmp_dir)
     dst = os.path.join(tmp_dir, "VBCABLE_Setup_x64.exe")
-    shutil.copy2(installer_path, dst)
-    # 以管理员权限运行，不加 /S 让用户交互安装
+    # 以管理员权限运行，设置工作目录为临时目录
     ctypes.windll.shell32.ShellExecuteW(
         None, "runas", dst, "", tmp_dir, 1
     )
