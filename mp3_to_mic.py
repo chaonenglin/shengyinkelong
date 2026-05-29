@@ -8,6 +8,7 @@
 
 import os, sys, struct, threading, subprocess
 from pathlib import Path
+import ctypes
 
 import numpy as np
 import sounddevice as sd
@@ -72,6 +73,58 @@ def find_ffmpeg():
                     if "ffmpeg.exe" in files:
                         return os.path.join(root, "ffmpeg.exe")
     return None
+
+
+def find_vbcable_installer():
+    """查找 VB-Cable 安装程序"""
+    # 1. 打包后的临时目录
+    if hasattr(sys, '_MEIPASS'):
+        p = os.path.join(sys._MEIPASS, "VBCABLE_Setup_x64.exe")
+        if os.path.isfile(p):
+            return p
+    # 2. exe 同目录
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+        p = os.path.join(exe_dir, "VBCABLE_Setup_x64.exe")
+        if os.path.isfile(p):
+            return p
+    # 3. 脚本同目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(script_dir, "VBCABLE_Setup_x64.exe")
+    if os.path.isfile(p):
+        return p
+    return None
+
+
+def check_vbcable_installed():
+    """检查 VB-Cable 是否已安装（通过注册表）"""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                             r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                             0, winreg.KEY_READ)
+        winreg.CloseKey(key)
+    except:
+        pass
+    # 通过设备名检测
+    p = pyaudio.PyAudio()
+    try:
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            name = info["name"].lower()
+            if "cable" in name or "vb-audio" in name:
+                return True
+    finally:
+        p.terminate()
+    return False
+
+
+def install_vbcable(installer_path):
+    """以管理员权限运行 VB-Cable 安装程序"""
+    # ShellExecute with "runas" 提权
+    ctypes.windll.shell32.ShellExecuteW(
+        None, "runas", installer_path, "/S", None, 1
+    )
 
 
 def get_wasapi_devices():
@@ -351,7 +404,30 @@ class MainWindow(QMainWindow):
         self._ffmpeg = find_ffmpeg()
 
         self._build_ui()
+        self._check_vbcable()
         self._refresh_devices()
+
+    def _check_vbcable(self):
+        """检测 VB-Cable 是否安装，未安装则提示"""
+        if check_vbcable_installed():
+            return
+        installer = find_vbcable_installer()
+        if not installer:
+            return
+        reply = QMessageBox.question(
+            self, "需要安装虚拟音频驱动",
+            "未检测到 VB-Audio Virtual Cable（虚拟麦克风驱动）。\n\n"
+            "是否立即安装？安装后需重启本程序。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            install_vbcable(installer)
+            QMessageBox.information(
+                self, "安装提示",
+                "安装程序已启动，请按提示完成安装。\n\n"
+                "安装完成后请关闭本程序并重新打开。"
+            )
 
     def _build_ui(self):
         # 中心 widget
