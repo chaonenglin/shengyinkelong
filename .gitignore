@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build artifacts
+bagpag/
+build/
+dist/
+*.spec.bak
+*.rar
+
+# Temp audio files
+tmp*.mp3
+
+# IDE
+.vscode/
+.idea/
