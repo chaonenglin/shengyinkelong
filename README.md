@@ -62,7 +62,3 @@ python mp3_to_mic.py
 ├── requirements.txt       # Python 依赖
 └── 音频转虚拟麦克风.spec   # PyInstaller 打包配置
 ```
-
-## License
-
-MIT
