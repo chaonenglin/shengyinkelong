@@ -188,30 +188,41 @@ def find_real_speaker(devices):
 
 
 def decode_audio(file_path, ffmpeg_path=None):
+    import wave, tempfile
     file_path = str(file_path)
     ext = Path(file_path).suffix.lower()
     # MP3 必须有 ffmpeg
     if ext == ".mp3" and not ffmpeg_path:
         raise RuntimeError("缺少 ffmpeg，无法解码 MP3\n请安装 ffmpeg 或下载完整版程序")
     if ext == ".mp3" and ffmpeg_path:
-        cmd = [ffmpeg_path, "-i", file_path, "-f", "wav", "-acodec", "pcm_s16le",
-               "-ar", "48000", "-ac", "2", "pipe:1"]
-        result = subprocess.run(cmd, capture_output=True, timeout=60)
-        if result.returncode != 0:
-            err = result.stderr.decode(errors="ignore")[-200:] if result.stderr else ""
-            raise RuntimeError(f"ffmpeg 解码失败: {err}")
-        data = result.stdout
-        idx = data.find(b"data")
-        if idx == -1:
-            raise RuntimeError("ffmpeg 输出格式错误")
-        idx += 4
-        if len(data) >= idx + 4:
-            size = struct.unpack("<I", data[idx:idx+4])[0]
-            pcm_data = data[idx+4:idx+4+size]
-        else:
-            pcm_data = data[idx:]
-        audio = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
-        return audio.reshape(-1, 2), 48000
+        # 用临时文件代替管道，避免中文路径和大文件问题
+        tmp_wav = os.path.join(tempfile.gettempdir(), "_vbcable_decode.wav")
+        try:
+            cmd = [
+                ffmpeg_path, "-y", "-i", file_path,
+                "-f", "wav", "-acodec", "pcm_s16le",
+                "-ar", "48000", "-ac", "2", tmp_wav
+            ]
+            result = subprocess.run(cmd, capture_output=True, timeout=120,
+                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            if result.returncode != 0 or not os.path.isfile(tmp_wav):
+                err = result.stderr.decode(errors="ignore")[-200:] if result.stderr else ""
+                raise RuntimeError(f"ffmpeg 解码失败: {err}")
+            with wave.open(tmp_wav, 'rb') as wf:
+                frames = wf.readframes(wf.getnframes())
+                sr = wf.getframerate()
+                ch = wf.getnchannels()
+            audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+            if ch > 1:
+                audio = audio.reshape(-1, ch)
+            else:
+                audio = np.column_stack([audio, audio])
+            return audio, sr
+        finally:
+            try:
+                os.remove(tmp_wav)
+            except:
+                pass
     else:
         seg = AudioSegment.from_file(file_path).set_frame_rate(48000).set_channels(2)
         samples = np.array(seg.get_array_of_samples(), dtype=np.float32).reshape(-1, 2)
@@ -858,55 +869,70 @@ class MainWindow(QMainWindow):
         self._decode_thread.start()
 
     def _on_decoded(self, path, audio, sr):
-        self.audio_data = audio
-        self.sample_rate = sr
-        self.current_file = path
-        dur = len(audio) / sr
-        self.status_label.setText(f"播放: {Path(path).name} ({dur:.1f}s)")
-        self.status_label.setStyleSheet(f"color: #4a9; background: transparent; font: 10px 'Microsoft YaHei';")
-        self._do_play()
+        try:
+            if audio is None or len(audio) == 0:
+                self.status_label.setText("解码结果为空")
+                return
+            self.audio_data = audio
+            self.sample_rate = sr
+            self.current_file = path
+            dur = len(audio) / sr
+            self.status_label.setText(f"播放: {Path(path).name} ({dur:.1f}s)")
+            self.status_label.setStyleSheet(f"color: #4a9; background: transparent; font: 10px 'Microsoft YaHei';")
+            self._do_play()
+        except Exception as e:
+            self.status_label.setText(f"播放失败: {e}")
+            self.status_label.setStyleSheet(f"color: #f44; background: transparent; font: 10px 'Microsoft YaHei';")
 
     def _do_play(self):
-        if self.audio_data is None:
-            return
-        mic_idx = self._get_dev_idx(self.mic_combo, self.mic_devs)
-        spk_idx = self._get_dev_idx(self.spk_combo, self.spk_devs)
+        try:
+            if self.audio_data is None:
+                return
+            mic_idx = self._get_dev_idx(self.mic_combo, self.mic_devs)
+            spk_idx = self._get_dev_idx(self.spk_combo, self.spk_devs)
 
-        if mic_idx is None and spk_idx is None:
-            return
+            if mic_idx is None and spk_idx is None:
+                self.status_label.setText("未选择音频设备")
+                return
 
-        self.wasapi_streams = []
-        audio = self.audio_data
-        sr = self.sample_rate
-        ch = audio.shape[1] if audio.ndim > 1 else 2
+            self.wasapi_streams = []
+            audio = self.audio_data
+            sr = self.sample_rate
+            ch = audio.shape[1] if audio.ndim > 1 else 2
 
-        if mic_idx is not None:
-            s = WASAPIStream(mic_idx, sr, ch)
-            s.start(audio, self.volume)
-            self.wasapi_streams.append(s)
-        if spk_idx is not None:
-            s = WASAPIStream(spk_idx, sr, ch)
-            s.start(audio, self.volume)
-            self.wasapi_streams.append(s)
+            if mic_idx is not None:
+                s = WASAPIStream(mic_idx, sr, ch)
+                s.start(audio, self.volume)
+                self.wasapi_streams.append(s)
+            if spk_idx is not None:
+                s = WASAPIStream(spk_idx, sr, ch)
+                s.start(audio, self.volume)
+                self.wasapi_streams.append(s)
 
-        self.status_label.setText("播放中...")
-        self.status_label.setStyleSheet(f"color: #4a9; background: transparent; font: 10px 'Microsoft YaHei';")
+            self.status_label.setText("播放中...")
+            self.status_label.setStyleSheet(f"color: #4a9; background: transparent; font: 10px 'Microsoft YaHei';")
 
-        self._play_timer = QTimer()
-        self._play_timer.timeout.connect(self._check_play_done)
-        self._play_timer.start(100)
+            self._play_timer = QTimer()
+            self._play_timer.timeout.connect(self._check_play_done)
+            self._play_timer.start(100)
+        except Exception as e:
+            self.status_label.setText(f"播放失败: {e}")
+            self.status_label.setStyleSheet(f"color: #f44; background: transparent; font: 10px 'Microsoft YaHei';")
 
     def _check_play_done(self):
-        if not any(s.is_active() for s in self.wasapi_streams):
-            self._play_timer.stop()
-            for s in self.wasapi_streams:
-                s.stop()
-            self.wasapi_streams = []
-            if self.auto_play:
-                QTimer.singleShot(100, self._play_next)
-            else:
-                self.status_label.setText("播放完成")
-                self.status_label.setStyleSheet(f"color: #4a9; background: transparent; font: 10px 'Microsoft YaHei';")
+        try:
+            if not any(s.is_active() for s in self.wasapi_streams):
+                self._play_timer.stop()
+                for s in self.wasapi_streams:
+                    s.stop()
+                self.wasapi_streams = []
+                if self.auto_play:
+                    QTimer.singleShot(100, self._play_next)
+                else:
+                    self.status_label.setText("播放完成")
+                    self.status_label.setStyleSheet(f"color: #4a9; background: transparent; font: 10px 'Microsoft YaHei';")
+        except Exception:
+            pass
 
     def _stop(self):
         for s in self.wasapi_streams:
