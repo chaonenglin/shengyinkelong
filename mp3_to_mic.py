@@ -174,17 +174,45 @@ def get_device_sample_rate(device_index):
         p.terminate()
 
 
-def pyaudio_to_sd_index(pyaudio_name):
-    """将 pyaudio 设备名映射到 sounddevice 设备索引"""
+def pyaudio_to_sd_index(pyaudio_name, is_input=False):
+    """将 pyaudio 设备名映射到 sounddevice 设备索引
+    is_input=True 时查找输入设备（麦克风），否则查找输出设备（扬声器/虚拟线缆）"""
     name_lower = pyaudio_name.lower().strip()
+    direction_key = 'max_input_channels' if is_input else 'max_output_channels'
+    # 精确匹配
     for dev in sd.query_devices():
-        if dev['name'].lower().strip() == name_lower and dev['max_output_channels'] > 0:
+        if dev['name'].lower().strip() == name_lower and dev[direction_key] > 0:
             return dev['index']
     # 模糊匹配
     for dev in sd.query_devices():
         dev_name = dev['name'].lower().strip()
-        if name_lower in dev_name or dev_name in name_lower:
-            if dev['max_output_channels'] > 0:
+        if (name_lower in dev_name or dev_name in name_lower) and dev[direction_key] > 0:
+            return dev['index']
+    return None
+
+
+def find_sd_wasapi_device(pyaudio_name, is_input=False):
+    """在 sounddevice 的 Windows WASAPI host API 中匹配设备索引。
+    用于麦克风输入等场景，确保使用 WASAPI 后端而非 DirectSound，避免与 pyaudiowpatch 时钟不同步。"""
+    name_lower = pyaudio_name.lower().strip()
+    wasapi_api_idx = None
+    for api in sd.query_hostapis():
+        if 'wasapi' in api['name'].lower():
+            wasapi_api_idx = api['index']
+            break
+    if wasapi_api_idx is None:
+        return None
+    direction_key = 'max_input_channels' if is_input else 'max_output_channels'
+    # 精确匹配
+    for dev in sd.query_devices():
+        if dev['hostapi'] == wasapi_api_idx and dev[direction_key] > 0:
+            if dev['name'].lower().strip() == name_lower:
+                return dev['index']
+    # 模糊匹配
+    for dev in sd.query_devices():
+        if dev['hostapi'] == wasapi_api_idx and dev[direction_key] > 0:
+            dn = dev['name'].lower().strip()
+            if name_lower in dn or dn in name_lower:
                 return dev['index']
     return None
 
@@ -223,6 +251,30 @@ def get_loopback_devices():
                 name = info["name"]
                 if "WASAPI" in host and ("loopback" in name.lower() or "立体声混音" in name):
                     devices.append({"index": i, "name": name})
+    finally:
+        p.terminate()
+    return devices
+
+
+def get_mic_devices():
+    """枚举真实麦克风设备（排除 loopback、virtual cable 等）"""
+    p = pyaudio.PyAudio()
+    devices = []
+    try:
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if info["maxInputChannels"] > 0:
+                host = p.get_host_api_info_by_index(info["hostApi"])["name"]
+                if "WASAPI" not in host:
+                    continue
+                name = info["name"]
+                nl = name.lower()
+                # 排除 loopback 和虚拟设备
+                if "loopback" in nl or "立体声混音" in nl:
+                    continue
+                if any(kw in nl for kw in VBAUDIO_KEYWORDS):
+                    continue
+                devices.append({"index": i, "name": name})
     finally:
         p.terminate()
     return devices
@@ -297,7 +349,7 @@ if _ffmpeg:
 
 # === 播放流（使用 sounddevice，更稳定） ===
 class WASAPIStream:
-    def __init__(self, device_index, sample_rate, channels):
+    def __init__(self, device_index, sample_rate, channels, mic_capture=None):
         self.idx = device_index
         self.sr = sample_rate
         self.ch = channels
@@ -305,6 +357,7 @@ class WASAPIStream:
         self._data = None
         self._frame = 0
         self._stop = False
+        self._mic = mic_capture
 
     def start(self, audio_data, volume=1.0):
         self._data = audio_data.copy() * volume
@@ -323,6 +376,21 @@ class WASAPIStream:
                 outdata[len(chunk):] = 0
                 raise sd.CallbackStop()
             outdata[:] = chunk
+            # 混入麦克风（通过 self._mic 支持热切换）
+            mic = self._mic
+            if mic:
+                try:
+                    mic_data = mic.read(frames)
+                    # 安全叠加：确保形状匹配（mic_data 始终为立体声，需适配输出通道数）
+                    if mic_data.shape[1] == outdata.shape[1]:
+                        outdata[:] += mic_data
+                    elif outdata.shape[1] == 1 and mic_data.shape[1] >= 1:
+                        outdata[:, 0] += mic_data[:, 0]
+                    elif outdata.shape[1] == 2 and mic_data.shape[1] == 1:
+                        outdata[:, 0] += mic_data[:, 0]
+                        outdata[:, 1] += mic_data[:, 0]
+                except Exception:
+                    pass
             self._frame = e
 
         self.stream = sd.OutputStream(
@@ -331,6 +399,10 @@ class WASAPIStream:
             blocksize=CHUNK_SIZE
         )
         self.stream.start()
+
+    def set_mic_capture(self, mic_capture):
+        """热切换麦克风混音源（可在播放中途调用）"""
+        self._mic = mic_capture
 
     def is_active(self):
         return self.stream and self.stream.active and not self._stop
@@ -347,7 +419,7 @@ class WASAPIStream:
 
 # === Loopback 捕获（pyaudiowpatch 输入 + sounddevice 输出） ===
 class WASAPICapture:
-    def __init__(self, capture_idx, output_idx, monitor_idx=None, sr=48000, ch=2):
+    def __init__(self, capture_idx, output_idx, monitor_idx=None, sr=48000, ch=2, mic_capture=None):
         self.p = pyaudio.PyAudio()
         self.cap_idx = capture_idx
         self.out_idx = output_idx
@@ -364,6 +436,7 @@ class WASAPICapture:
         self._lock = threading.Lock()
         self._sd_out = None
         self._sd_mon = None
+        self._mic = mic_capture
 
     def start(self, volume=1.0):
         self._vol = volume
@@ -415,13 +488,25 @@ class WASAPICapture:
                     self._buf_out = np.zeros((0, self.ch), dtype=np.float32)
                 else:
                     outdata[:] = 0
+            # 混入麦克风（通过 self._mic 支持热切换）
+            mic = self._mic
+            if mic:
+                try:
+                    mic_data = mic.read(frames)
+                    if mic_data.shape[1] == outdata.shape[1]:
+                        outdata[:] += mic_data
+                    elif outdata.shape[1] == 2 and mic_data.shape[1] == 1:
+                        outdata[:, 0] += mic_data[:, 0]
+                        outdata[:, 1] += mic_data[:, 0]
+                except Exception:
+                    pass
 
         self._sd_out = sd.OutputStream(
             device=self.out_idx, channels=self.ch, samplerate=self.sr,
             callback=out_callback, dtype='float32', blocksize=CHUNK_SIZE)
         self._sd_out.start()
 
-        # sounddevice 输出到监听扬声器
+        # sounddevice 输出到监听扬声器（不混入麦克风，避免耳返回声）
         if self.mon_idx is not None and self.mon_idx != self.out_idx:
             def mon_callback(outdata, frames, time_info, status):
                 with self._lock:
@@ -445,6 +530,10 @@ class WASAPICapture:
             return self.cap_stream and self.cap_stream.is_active() and not self._stop
         except Exception:
             return False
+
+    def set_mic_capture(self, mic_capture):
+        """热切换麦克风混音源（可在截取中途调用）"""
+        self._mic = mic_capture
 
     def set_volume(self, v):
         self._vol = v
@@ -473,6 +562,99 @@ class WASAPICapture:
             self.p.terminate()
         except:
             pass
+
+
+# === 麦克风捕获（混入虚拟麦克风） ===
+class MicCapture:
+    """用 pyaudiowpatch WASAPI 回调采集麦克风，独立线程写入 ring buffer。
+    输出流的 sounddevice 回调只读取 buffer，不涉及跨 API 时钟同步，消除卡顿。"""
+    def __init__(self):
+        self._p = None
+        self._stream = None
+        self._buf = np.zeros((0, 2), dtype=np.float32)
+        self._lock = threading.Lock()
+        self._vol = 1.0
+        self._sr = 48000
+
+    def start(self, device_idx, sample_rate=48000):
+        self._sr = sample_rate
+        self._buf = np.zeros((0, 2), dtype=np.float32)
+        self._p = pyaudio.PyAudio()
+        vol = self._vol
+
+        def callback(in_data, frame_count, time_info, status):
+            try:
+                # pyaudiowpatch 回调：in_data 是 bytes (int16)，单声道
+                data = np.frombuffer(in_data, dtype=np.int16).reshape(-1, 1).astype(np.float32) / 32768.0
+                # 单声道 → 双声道
+                data = np.column_stack([data[:, 0], data[:, 0]])
+                if vol != 1.0:
+                    data = data * vol
+                with self._lock:
+                    self._buf = np.concatenate([self._buf, data])
+                # 限制 buffer：最多保留 2 秒，超出丢弃最老的
+                max_buf = sample_rate * 2
+                if len(self._buf) > max_buf:
+                    self._buf = self._buf[-max_buf // 2:]
+            except Exception:
+                pass
+            return (b'', pyaudio.paContinue)
+
+        try:
+            self._stream = self._p.open(
+                format=pyaudio.paInt16, channels=1,
+                rate=sample_rate, input=True,
+                input_device_index=device_idx,
+                frames_per_buffer=CHUNK_SIZE,
+                stream_callback=callback)
+            self._stream.start_stream()
+        except Exception as e:
+            if self._p:
+                try:
+                    self._p.terminate()
+                except:
+                    pass
+            self._p = None
+            raise RuntimeError(f"无法打开麦克风设备:\n{e}")
+
+    def read(self, frames):
+        """读取指定帧数的麦克风数据。优先保证流畅不卡：
+        - buffer 充足 → 正常输出
+        - buffer 不足但有数据 → 全部拿出，尾部补零
+        - buffer 完全空 → 输出静音"""
+        with self._lock:
+            if len(self._buf) >= frames:
+                chunk = self._buf[:frames].copy()
+                self._buf = self._buf[frames:]
+                return chunk
+            elif len(self._buf) > 0:
+                chunk = self._buf.copy()
+                self._buf = np.zeros((0, 2), dtype=np.float32)
+                pad = np.zeros((frames - len(chunk), 2), dtype=np.float32)
+                return np.concatenate([chunk, pad])
+            else:
+                return np.zeros((frames, 2), dtype=np.float32)
+
+    def set_volume(self, v):
+        self._vol = v
+
+    def is_active(self):
+        return self._stream and self._stream.is_active()
+
+    def stop(self):
+        if self._stream:
+            try:
+                self._stream.stop_stream()
+                self._stream.close()
+            except:
+                pass
+        self._stream = None
+        if self._p:
+            try:
+                self._p.terminate()
+            except:
+                pass
+        self._p = None
 
 
 # === 解码线程 ===
@@ -507,6 +689,7 @@ class MainWindow(QMainWindow):
         self.current_file = None
         self.wasapi_streams = []
         self.capture = None
+        self.mic_capture = None
         self.volume = 0.8
         self.auto_play = True
         self.play_mode = "seq"
@@ -615,6 +798,43 @@ class MainWindow(QMainWindow):
         # 扬声器
         spk_row = self._make_device_row("扬声器（监听）", "spk")
         dev_layout.addWidget(spk_row)
+
+        # 麦克风混音行
+        mic_mix_row = QWidget()
+        mic_mix_row.setStyleSheet("background: transparent;")
+        mic_mix_layout = QHBoxLayout(mic_mix_row)
+        mic_mix_layout.setContentsMargins(0, 0, 0, 0)
+        mic_mix_layout.setSpacing(6)
+
+        mic_label = QLabel("麦克风")
+        mic_label.setStyleSheet(f"color: {GOLD}; background: transparent; font: 10px 'Microsoft YaHei';")
+        mic_label.setFixedWidth(90)
+        mic_mix_layout.addWidget(mic_label)
+
+        self.mic_input_combo = QComboBox()
+        self.mic_input_combo.setStyleSheet(self._combo_style())
+        mic_mix_layout.addWidget(self.mic_input_combo, 1)
+
+        self.mic_mix_cb = QPushButton("🎤 混音: 关")
+        self.mic_mix_cb.setCheckable(True)
+        self.mic_mix_cb.setFixedSize(80, 26)
+        self.mic_mix_cb.setStyleSheet(self._btn_style(BG3, TEXT2))
+        self.mic_mix_cb.clicked.connect(self._toggle_mic_mix)
+        mic_mix_layout.addWidget(self.mic_mix_cb)
+
+        self.mic_vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.mic_vol_slider.setRange(0, 200)
+        self.mic_vol_slider.setValue(100)
+        self.mic_vol_slider.setFixedWidth(70)
+        self.mic_vol_slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{ background: {BG3}; height: 4px; border-radius: 2px; }}
+            QSlider::handle:horizontal {{ background: {GOLD}; width: 14px; margin: -5px 0; border-radius: 7px; }}
+            QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 2px; }}
+        """)
+        self.mic_vol_slider.valueChanged.connect(lambda v: self.mic_capture.set_volume(v / 100) if self.mic_capture else None)
+        mic_mix_layout.addWidget(self.mic_vol_slider)
+
+        dev_layout.addWidget(mic_mix_row)
 
         layout.addWidget(dev_widget)
 
@@ -907,6 +1127,12 @@ class MainWindow(QMainWindow):
         for d in self._loopback_devices:
             self.cap_combo.addItem(d["name"])
 
+        # 麦克风设备
+        self._mic_devices = get_mic_devices()
+        self.mic_input_combo.clear()
+        for d in self._mic_devices:
+            self.mic_input_combo.addItem(d["name"])
+
     def _switch_mode(self, mode):
         if mode == "capture":
             self._stop()
@@ -991,7 +1217,13 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("未选择音频设备")
                 return
 
+            # 麦克风混音
+            mic_cap = None
+            if self.mic_mix_cb.isChecked():
+                mic_cap = self._start_mic_capture()
+
             self.wasapi_streams = []
+            self._mic_stream = None  # 虚拟麦克风流（用于热切换混音，不带耳返）
             audio = self.audio_data
             orig_sr = self.sample_rate
             ch = audio.shape[1] if audio.ndim > 1 else 2
@@ -1001,14 +1233,15 @@ class MainWindow(QMainWindow):
                 mic_name = self.mic_devs[self.mic_combo.currentIndex()]["name"]
                 sd_idx = pyaudio_to_sd_index(mic_name)
                 if sd_idx is not None:
-                    s = WASAPIStream(sd_idx, orig_sr, ch)
+                    s = WASAPIStream(sd_idx, orig_sr, ch, mic_capture=mic_cap)
                     s.start(audio, self.volume)
                     self.wasapi_streams.append(s)
+                    self._mic_stream = s  # 标记为虚拟麦克风流
             if spk_idx is not None:
                 spk_name = self.spk_devs[self.spk_combo.currentIndex()]["name"]
                 sd_idx = pyaudio_to_sd_index(spk_name)
                 if sd_idx is not None:
-                    s = WASAPIStream(sd_idx, orig_sr, ch)
+                    s = WASAPIStream(sd_idx, orig_sr, ch)  # 扬声器不混入麦克风（无耳返）
                     s.start(audio, self.volume)
                     self.wasapi_streams.append(s)
 
@@ -1043,6 +1276,7 @@ class MainWindow(QMainWindow):
         self.wasapi_streams = []
         if hasattr(self, '_play_timer'):
             self._play_timer.stop()
+        self._stop_mic_capture()
         self.status_label.setText("已停止")
         self.status_label.setStyleSheet(f"color: #f90; background: transparent; font: 10px 'Microsoft YaHei';")
 
@@ -1070,6 +1304,59 @@ class MainWindow(QMainWindow):
             self.play_mode = "seq"
             self.auto_btn.setText("顺序播放")
             self.auto_btn.setStyleSheet(self._btn_style(ACCENT, "white"))
+
+    def _toggle_mic_mix(self):
+        try:
+            if self.mic_mix_cb.isChecked():
+                self.mic_mix_cb.setText("🎤 混音: 开")
+                self.mic_mix_cb.setStyleSheet(self._btn_style("#2d5a3d", "white", bold=True))
+                # 启动麦克风捕获，只注入虚拟麦克风流（不注入扬声器，无耳返）
+                mic = self._start_mic_capture()
+                if mic:
+                    if getattr(self, '_mic_stream', None):
+                        self._mic_stream.set_mic_capture(mic)
+                    if self.capture:
+                        self.capture.set_mic_capture(mic)
+            else:
+                self.mic_mix_cb.setText("🎤 混音: 关")
+                self.mic_mix_cb.setStyleSheet(self._btn_style(BG3, TEXT2))
+                # 清除虚拟麦克风流中的引用
+                if getattr(self, '_mic_stream', None):
+                    self._mic_stream.set_mic_capture(None)
+                if self.capture:
+                    self.capture.set_mic_capture(None)
+                self._stop_mic_capture()
+        except Exception as e:
+            self._stop_mic_capture()
+            self.mic_mix_cb.setChecked(False)
+            self.mic_mix_cb.setText("🎤 混音: 关")
+            self.mic_mix_cb.setStyleSheet(self._btn_style(BG3, TEXT2))
+            QMessageBox.warning(self, "麦克风混音失败", f"无法打开麦克风:\n{e}")
+
+    def _start_mic_capture(self):
+        """创建并启动 MicCapture（pyaudiowpatch WASAPI 原生 API）"""
+        self._stop_mic_capture()
+        if not self._mic_devices:
+            raise RuntimeError("未找到麦克风设备列表，请点击刷新")
+        idx = self.mic_input_combo.currentIndex()
+        if idx < 0 or idx >= len(self._mic_devices):
+            raise RuntimeError("未选择麦克风设备")
+        dev = self._mic_devices[idx]
+        # 直接使用 pyaudiowpatch 的设备索引（WASAPI 原生）
+        mic = MicCapture()
+        mic.start(dev["index"], 48000)
+        mic.set_volume(self.mic_vol_slider.value() / 100)
+        self.mic_capture = mic
+        return mic
+
+    def _stop_mic_capture(self):
+        """停止并释放 MicCapture"""
+        if self.mic_capture:
+            try:
+                self.mic_capture.stop()
+            except:
+                pass
+        self.mic_capture = None
 
     def _get_dev_idx(self, combo, devs):
         idx = combo.currentIndex()
@@ -1105,7 +1392,12 @@ class MainWindow(QMainWindow):
                 spk_name = self.spk_devs[self.spk_combo.currentIndex()]["name"]
                 sd_mon_idx = pyaudio_to_sd_index(spk_name)
 
-            self.capture = WASAPICapture(cap_idx, sd_out_idx, sd_mon_idx)
+            # 麦克风混音
+            mic_cap = None
+            if self.mic_mix_cb.isChecked():
+                mic_cap = self._start_mic_capture()
+
+            self.capture = WASAPICapture(cap_idx, sd_out_idx, sd_mon_idx, mic_capture=mic_cap)
             self.capture.start(volume=self.cap_vol_slider.value() / 100)
             self.cap_start_btn.setEnabled(False)
             self.cap_stop_btn.setEnabled(True)
@@ -1135,6 +1427,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.capture = None
+        self._stop_mic_capture()
         self.cap_start_btn.setEnabled(True)
         self.cap_stop_btn.setEnabled(False)
         self.cap_status.setText("已停止")
