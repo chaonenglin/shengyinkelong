@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QComboBox, QSlider, QListWidget, QFrame,
     QFileDialog, QMessageBox, QListWidgetItem
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
 from PyQt6.QtGui import QPixmap, QFont, QColor, QPainter, QLinearGradient
 
 # === 常量 ===
@@ -695,6 +695,8 @@ class MainWindow(QMainWindow):
         self.play_mode = "seq"
         self._audio_files = []
         self._drag_pos = None
+        self._file_hotkeys = {}  # row_index -> key_text
+        self._hotkey_files = {}  # key_text -> row_index
         self._ffmpeg = find_ffmpeg()
 
         self._build_ui()
@@ -895,6 +897,8 @@ class MainWindow(QMainWindow):
 
         # 文件列表
         self.file_list = QListWidget()
+        self.file_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.file_list.customContextMenuRequested.connect(self._on_context_menu)
         self.file_list.setStyleSheet(f"""
             QListWidget {{
                 background: transparent; color: {TEXT}; border: none;
@@ -965,6 +969,12 @@ class MainWindow(QMainWindow):
         """)
         self.vol_slider.valueChanged.connect(lambda v: setattr(self, 'volume', v / 100))
         ctrl_layout.addWidget(self.vol_slider)
+
+        self.clear_hk_btn = QPushButton("清除快捷键")
+        self.clear_hk_btn.setFixedSize(80, 24)
+        self.clear_hk_btn.setStyleSheet(self._btn_style(BG3, TEXT2))
+        self.clear_hk_btn.clicked.connect(self._clear_all_hotkeys)
+        ctrl_layout.addWidget(self.clear_hk_btn)
         ctrl_layout.addStretch()
 
         mp3_layout.addWidget(ctrl_widget)
@@ -1156,11 +1166,14 @@ class MainWindow(QMainWindow):
 
     def _load_folder(self, folder):
         self._audio_files = []
+        self._file_hotkeys.clear()
+        self._hotkey_files.clear()
         self.file_list.clear()
         for f in sorted(os.listdir(folder)):
             if Path(f).suffix.lower() in AUDIO_EXTS:
                 self._audio_files.append(os.path.join(folder, f))
-                self.file_list.addItem(f)
+                row = len(self._audio_files) - 1
+                self.file_list.addItem(self._format_item_text(row, f))
         if self._audio_files:
             self.folder_label.setText(f"{Path(folder).name}  ({len(self._audio_files)} 个文件)")
             self.folder_label.setStyleSheet(f"color: {TEXT}; background: transparent; font: 10px 'Microsoft YaHei';")
@@ -1262,7 +1275,7 @@ class MainWindow(QMainWindow):
                 for s in self.wasapi_streams:
                     s.stop()
                 self.wasapi_streams = []
-                if self.auto_play:
+                if self.play_mode != "off":
                     QTimer.singleShot(100, self._play_next)
                 else:
                     self.status_label.setText("播放完成")
@@ -1300,6 +1313,10 @@ class MainWindow(QMainWindow):
             self.play_mode = "random"
             self.auto_btn.setText("随机播放")
             self.auto_btn.setStyleSheet(self._btn_style("#9C27B0", "white"))
+        elif self.play_mode == "random":
+            self.play_mode = "off"
+            self.auto_btn.setText("循环: 关")
+            self.auto_btn.setStyleSheet(self._btn_style(BG3, TEXT2))
         else:
             self.play_mode = "seq"
             self.auto_btn.setText("顺序播放")
@@ -1434,6 +1451,130 @@ class MainWindow(QMainWindow):
         self.cap_status.setStyleSheet(f"color: #f90; background: transparent; font: 10px 'Microsoft YaHei';")
         if hasattr(self, '_cap_timer'):
             self._cap_timer.stop()
+
+    # === 快捷键管理 ===
+    def _format_item_text(self, row, filename):
+        hk = self._file_hotkeys.get(row, "")
+        if hk:
+            return f"{filename}  [{hk}]"
+        return filename
+
+    def _update_item_display(self, row):
+        if 0 <= row < len(self._audio_files):
+            fname = Path(self._audio_files[row]).name
+            self.file_list.item(row).setText(self._format_item_text(row, fname))
+
+    def _on_context_menu(self, pos: QPoint):
+        item = self.file_list.itemAt(pos)
+        if not item:
+            return
+        row = self.file_list.row(item)
+        if row < 0 or row >= len(self._audio_files):
+            return
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{ background: {BG2}; color: {TEXT}; border: 1px solid {BG3}; padding: 4px; font: 10px 'Microsoft YaHei'; }}
+            QMenu::item {{ padding: 4px 20px; }}
+            QMenu::item:selected {{ background: {ACCENT}; color: white; }}
+        """)
+        set_action = menu.addAction("设置快捷键...")
+        menu.addSeparator()
+        clear_action = menu.addAction("清除快捷键")
+        if row not in self._file_hotkeys:
+            clear_action.setEnabled(False)
+        clear_all_action = menu.addAction("清除全部快捷键")
+        action = menu.exec(self.file_list.mapToGlobal(pos))
+        if action == set_action:
+            self._set_hotkey(row)
+        elif action == clear_action:
+            self._clear_hotkey(row)
+        elif action == clear_all_action:
+            self._clear_all_hotkeys()
+
+    def _set_hotkey(self, row):
+        """弹出对话框捕获按键，为指定行设置快捷键"""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout
+        dlg = QDialog(self)
+        dlg.setWindowTitle("设置快捷键")
+        dlg.setFixedSize(280, 120)
+        dlg.setStyleSheet(f"background: {BG2}; color: {TEXT};")
+        dlg_layout = QVBoxLayout(dlg)
+        hint = QLabel(f"请按下要绑定的按键...\n当前文件: {Path(self._audio_files[row]).name}")
+        hint.setStyleSheet(f"color: {GOLD}; font: 11px 'Microsoft YaHei'; background: transparent;")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dlg_layout.addWidget(hint)
+        pressed_key = [None]
+
+        def key_handler(event):
+            key = event.key()
+            if key == Qt.Key.Key_Escape:
+                dlg.reject()
+                return
+            # 允许的按键范围
+            if (Qt.Key.Key_F1 <= key <= Qt.Key.Key_F12 or
+                Qt.Key.Key_0 <= key <= Qt.Key.Key_9 or
+                Qt.Key.Key_A <= key <= Qt.Key.Key_Z):
+                text = Qt.Key(key).name  # 例如 "Key_F1"
+                # 转成友好显示名
+                if text.startswith("Key_"):
+                    text = text[4:]  # F1, F2, ..., 0, 1, ..., A, B, ...
+                pressed_key[0] = text
+                dlg.accept()
+
+        dlg.keyPressEvent = key_handler
+        dlg.exec()
+
+        key_text = pressed_key[0]
+        if not key_text:
+            return
+
+        # 如果该键已被其他文件占用，先清除
+        if key_text in self._hotkey_files:
+            old_row = self._hotkey_files[key_text]
+            self._file_hotkeys.pop(old_row, None)
+            self._update_item_display(old_row)
+
+        # 如果该文件已有快捷键，先清除旧映射
+        old_key = self._file_hotkeys.get(row)
+        if old_key:
+            self._hotkey_files.pop(old_key, None)
+
+        self._file_hotkeys[row] = key_text
+        self._hotkey_files[key_text] = row
+        self._update_item_display(row)
+
+    def _clear_hotkey(self, row):
+        key_text = self._file_hotkeys.pop(row, None)
+        if key_text:
+            self._hotkey_files.pop(key_text, None)
+        self._update_item_display(row)
+
+    def _clear_all_hotkeys(self):
+        self._file_hotkeys.clear()
+        self._hotkey_files.clear()
+        for row in range(len(self._audio_files)):
+            self._update_item_display(row)
+
+    def keyPressEvent(self, event):
+        """响应快捷键播放"""
+        key = event.key()
+        text = None
+        if Qt.Key.Key_F1 <= key <= Qt.Key.Key_F12:
+            text = Qt.Key(key).name[4:]
+        elif Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+            text = Qt.Key(key).name[4:]
+        elif Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+            text = Qt.Key(key).name[4:]
+
+        if text and text in self._hotkey_files:
+            row = self._hotkey_files[text]
+            if 0 <= row < len(self._audio_files):
+                self.file_list.setCurrentRow(row)
+                self._load_and_play(self._audio_files[row])
+                return
+
+        super().keyPressEvent(event)
 
     # === 拖拽支持 ===
     def dragEnterEvent(self, event):
